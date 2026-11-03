@@ -79,8 +79,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # ---------------------------------------------------------------------------
 # Config  (never hardcode real credentials in code; use environment variables)
 # ---------------------------------------------------------------------------
-MONGO_URL = (os.getenv("MONGO_URL") or os.getenv("MONGODB_URI") or os.getenv("MONGODB_URL")
-             or "mongodb://localhost:27017").strip().strip('"').strip("'")
+MONGO_URL = (os.getenv("MONGO_URL")
 MONGO_DB = os.getenv("MONGO_DB", "personal_library")
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "10"))
 MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
