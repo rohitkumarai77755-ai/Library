@@ -1,8 +1,10 @@
 """
 Personal Notes & Image Library  (single file: main.py)
 
-Run:   python main.py
-Open:  http://127.0.0.1:8000
+Run locally:   python main.py          ->  http://127.0.0.1:8000
+Run in Docker: docker build -t library .
+               docker run -p 8000:8000 -e MONGO_URL="mongodb+srv://..." library
+Render:        Start Command = python main.py   (do NOT use --reload)
 
 What it does:
   * First page: product description + one-step email login (no password, no sign-up).
@@ -16,20 +18,17 @@ What it does:
     previous/next, swipe, keyboard arrows and a thumbnail strip.
   * Date and time are taken automatically from the browser.
 
-Optional environment variables:
-  MONGO_URL      default mongodb://localhost:27017  (MONGODB_URI is also accepted)
+Environment variables:
+  MONGO_URL      default mongodb://localhost:27017  (MONGODB_URI / MONGODB_URL also accepted)
   MONGO_DB       default personal_library
   MAX_IMAGE_MB   default 10
   SESSION_DAYS   default 30
-  COOKIE_SECURE  set to 1 when served over HTTPS
-  HOST           default 127.0.0.1 (0.0.0.0 automatically on Render)
-  PORT           default 8000
+  COOKIE_SECURE  set to 1 when served over HTTPS (automatic on Render)
+  HOST           default 0.0.0.0  (reachable from anywhere)
+  PORT           default 8000     (Render sets this automatically)
 
-Install:  pip install -r requirements.txt
-(or just run it: missing libraries are installed automatically on first start).
-Settings can be placed in a .env file next to this file (see .env.example).
-A MongoDB server must be reachable. Database and collections are created
-automatically on first use.
+Settings can also be placed in a .env file next to this file.
+Health check: GET /healthz shows whether MongoDB is connected and the last error.
 """
 
 import importlib.util
@@ -38,7 +37,7 @@ import subprocess
 import sys
 
 # ---------------------------------------------------------------------------
-# Auto-install dependencies (no requirements.txt needed)
+# Auto-install dependencies when run outside Docker without requirements.txt
 # ---------------------------------------------------------------------------
 _PACKAGES = {
     "fastapi": "fastapi",
@@ -55,7 +54,6 @@ if _missing:
     print(f"Installing missing packages: {', '.join(_missing)} ...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", *_missing])
 
-import asyncio
 import hashlib
 import re
 import secrets
@@ -63,17 +61,17 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import certifi
 import uvicorn
 from bson import Binary, ObjectId
 from bson.errors import InvalidId
+from dotenv import load_dotenv
 from email_validator import EmailNotValidError, validate_email
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import PyMongoError
-import certifi
-from dotenv import load_dotenv
 
 # Load settings from a .env file next to this script (real environment variables take priority)
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
@@ -82,7 +80,7 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # Config  (never hardcode real credentials in code; use environment variables)
 # ---------------------------------------------------------------------------
 MONGO_URL = (os.getenv("MONGO_URL") or os.getenv("MONGODB_URI") or os.getenv("MONGODB_URL")
-             or "mongodb://localhost:27017").strip()
+             or "mongodb://localhost:27017").strip().strip('"').strip("'")
 MONGO_DB = os.getenv("MONGO_DB", "personal_library")
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "10"))
 MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
@@ -91,7 +89,7 @@ SESSION_DAYS = int(os.getenv("SESSION_DAYS", "30"))
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1" if os.getenv("RENDER") else "0") == "1"
 COOKIE_NAME = "lib_session"
 PORT = int(os.getenv("PORT", "8000"))
-HOST = os.getenv("HOST", "0.0.0.0" if os.getenv("RENDER") else "127.0.0.1")
+HOST = os.getenv("HOST", "0.0.0.0")   # 0.0.0.0 = accept connections from anywhere
 
 _mongo_opts = {"serverSelectionTimeoutMS": 20000, "connectTimeoutMS": 20000}
 if MONGO_URL.startswith("mongodb+srv://") or "tls=true" in MONGO_URL.lower() or "ssl=true" in MONGO_URL.lower():
@@ -104,8 +102,24 @@ users = db["users"]            # one record per email
 sessions = db["sessions"]      # login sessions (auto-expire)
 
 
+def _mask(url: str) -> str:
+    """Hide the password when printing the connection string."""
+    return re.sub(r"://([^:/@]+):([^@]+)@", r"://\1:****@", url)
+
+
 _db_ready = False
 _db_error = ""
+
+
+def _explain(err: str) -> str:
+    if "TLSV1_ALERT_INTERNAL_ERROR" in err or "SSL handshake failed" in err:
+        return ("Atlas refused the connection. Check: (1) Network Access has 0.0.0.0/0 in the SAME "
+                "project as this cluster, (2) the cluster is not paused, (3) MONGO_URL is correct.")
+    if "Authentication failed" in err or "bad auth" in err:
+        return "Wrong database username or password in MONGO_URL."
+    if "localhost:27017" in err:
+        return "MONGO_URL is not set, so the app tried localhost. Set MONGO_URL in your environment."
+    return "Check MONGO_URL and the MongoDB Atlas network access list."
 
 
 def ensure_db() -> None:
@@ -122,20 +136,19 @@ def ensure_db() -> None:
         sessions.create_index("expires_at", expireAfterSeconds=0)
         _db_ready = True
         _db_error = ""
+        print("MongoDB connected.")
     except PyMongoError as exc:
-        _db_error = str(exc)[:300]
-        raise HTTPException(
-            status_code=503,
-            detail="Database is not reachable. Check MONGO_URL and the MongoDB Atlas network access list.",
-        )
+        _db_error = str(exc)[:500]
+        raise HTTPException(status_code=503, detail="Database is not reachable. " + _explain(_db_error))
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    print(f"Using MongoDB: {_mask(MONGO_URL)}  (database: {MONGO_DB})")
     try:
         ensure_db()
-    except HTTPException:
-        print(f"WARNING: MongoDB is not reachable yet; will retry on each request. Details: {_db_error}")
+    except HTTPException as exc:
+        print(f"WARNING: MongoDB is not reachable yet; will retry on each request.\n  Hint: {exc.detail}\n  Details: {_db_error}")
     yield
     client.close()
 
@@ -254,7 +267,10 @@ def login(body: LoginBody, response: Response):
 def logout(request: Request, response: Response):
     token = request.cookies.get(COOKIE_NAME)
     if token:
-        sessions.delete_one({"token_hash": token_digest(token)})
+        try:
+            sessions.delete_one({"token_hash": token_digest(token)})
+        except PyMongoError:
+            pass
     response.delete_cookie(COOKIE_NAME, path="/")
     return {"ok": True}
 
@@ -665,7 +681,7 @@ function toast(msg, isErr) {
   t.textContent = msg;
   t.className = "toast show" + (isErr ? " err" : "");
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => (t.className = "toast"), 2800);
+  toast._t = setTimeout(() => (t.className = "toast"), isErr ? 5000 : 2800);
 }
 
 async function api(path, opts) {
@@ -677,7 +693,9 @@ async function api(path, opts) {
       msg = Array.isArray(d) ? d.map((x) => x.msg).join(", ") : d || msg;
     } catch (e) {}
     if (r.status === 401 && !path.startsWith("/api/login") && !path.startsWith("/api/me")) sessionEnded();
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = r.status;
+    throw err;
   }
   return r.json();
 }
@@ -1055,7 +1073,10 @@ setInterval(() => { if (!$("#app").hidden && $("#viewer").hidden && items.length
 /* ---------- start: already signed in? ---------- */
 (async () => {
   try { email = (await api("/api/me")).email; showApp(); }
-  catch (e) { showLogin(); }
+  catch (e) {
+    showLogin();
+    if (e.status === 503) toast(e.message, true);   // show database problems instead of hiding them
+  }
 })();
 </script>
 </body>
@@ -1063,15 +1084,26 @@ setInterval(() => { if (!$("#app").hidden && $("#viewer").hidden && items.length
 """
 
 
-@app.get("/healthz")
+# HEAD is allowed so Render / uptime checks get 200 instead of 405
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 def healthz():
-    return {"status": "ok", "database": "connected" if _db_ready else "unreachable"}
+    try:
+        ensure_db()
+    except HTTPException:
+        pass
+    return {
+        "status": "ok",
+        "database": "connected" if _db_ready else "unreachable",
+        "hint": "" if _db_ready else _explain(_db_error),
+        "error": "" if _db_ready else _db_error,
+    }
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def home():
     return HTMLResponse(PAGE)
 
 
 if __name__ == "__main__":
+    print(f"Starting on http://{HOST}:{PORT}")
     uvicorn.run(app, host=HOST, port=PORT)
