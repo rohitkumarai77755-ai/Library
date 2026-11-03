@@ -1,5 +1,3 @@
-
-
 """
 Personal Notes & Image Library  (single file: main.py)
 
@@ -24,11 +22,14 @@ Optional environment variables:
   MAX_IMAGE_MB   default 10
   SESSION_DAYS   default 30
   COOKIE_SECURE  set to 1 when served over HTTPS
+  HOST           default 127.0.0.1 (0.0.0.0 automatically on Render)
   PORT           default 8000
 
-No requirements.txt needed: missing libraries are installed automatically
-the first time this file starts. A MongoDB server must be reachable.
-Database and collections are created automatically on first use.
+Install:  pip install -r requirements.txt
+(or just run it: missing libraries are installed automatically on first start).
+Settings can be placed in a .env file next to this file (see .env.example).
+A MongoDB server must be reachable. Database and collections are created
+automatically on first use.
 """
 
 import importlib.util
@@ -45,21 +46,23 @@ _PACKAGES = {
     "pymongo": "pymongo",
     "python_multipart": "python-multipart",
     "email_validator": "email-validator",
-    "python-dotenv": "python-dotenv",
+    "dotenv": "python-dotenv",
+    "certifi": "certifi",
+    "dns": "dnspython",
 }
 _missing = [pkg for mod, pkg in _PACKAGES.items() if importlib.util.find_spec(mod) is None]
 if _missing:
     print(f"Installing missing packages: {', '.join(_missing)} ...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", *_missing])
 
+import asyncio
 import hashlib
 import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-import os
-from dotenv import load_dotenv
+
 import uvicorn
 from bson import Binary, ObjectId
 from bson.errors import InvalidId
@@ -69,8 +72,12 @@ from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.errors import PyMongoError
+import certifi
+from dotenv import load_dotenv
 
-load_dotenv()
+# Load settings from a .env file next to this script (real environment variables take priority)
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 # ---------------------------------------------------------------------------
 # Config  (never hardcode real credentials in code; use environment variables)
 # ---------------------------------------------------------------------------
@@ -80,11 +87,15 @@ MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "10"))
 MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
 SESSION_DAYS = int(os.getenv("SESSION_DAYS", "30"))
-COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") == "1"
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1" if os.getenv("RENDER") else "0") == "1"
 COOKIE_NAME = "lib_session"
 PORT = int(os.getenv("PORT", "8000"))
+HOST = os.getenv("HOST", "0.0.0.0" if os.getenv("RENDER") else "127.0.0.1")
 
-client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+_mongo_opts = {"serverSelectionTimeoutMS": 20000, "connectTimeoutMS": 20000}
+if MONGO_URL.startswith("mongodb+srv://") or "tls=true" in MONGO_URL.lower() or "ssl=true" in MONGO_URL.lower():
+    _mongo_opts["tlsCAFile"] = certifi.where()   # trusted CA bundle for Atlas / TLS connections
+client = MongoClient(MONGO_URL, **_mongo_opts)
 db = client[MONGO_DB]
 notes = db["saved_items"]      # one document per saved text / image
 images = db["library_images"]  # raw image bytes
@@ -94,10 +105,23 @@ sessions = db["sessions"]      # login sessions (auto-expire)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    try:
-        client.admin.command("ping")
-    except PyMongoError as exc:
-        raise RuntimeError(f"Cannot connect to MongoDB at the configured MONGO_URL: {exc}")
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            client.admin.command("ping")
+            last_error = None
+            break
+        except PyMongoError as exc:
+            last_error = exc
+            print(f"MongoDB connection attempt {attempt}/3 failed.")
+            if attempt < 3:
+                await asyncio.sleep(3)
+    if last_error is not None:
+        raise RuntimeError(
+            "Cannot connect to MongoDB. If you use MongoDB Atlas: open Network Access and allow this "
+            "server's IP (on Render use 0.0.0.0/0), and check the user/password in MONGO_URL. "
+            f"Details: {str(last_error)[:300]}"
+        )
     notes.create_index([("email", 1), ("created_at", -1)])
     images.create_index([("email", 1)])
     users.create_index("email", unique=True)
@@ -1034,4 +1058,4 @@ def home():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT)
