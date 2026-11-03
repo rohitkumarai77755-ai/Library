@@ -19,7 +19,7 @@ What it does:
   * Date and time are taken automatically from the browser.
 
 Environment variables:
-  MONGO_URL      default mongodb://localhost:27017  (MONGODB_URI / MONGODB_URL also accepted)
+  MONGO_URL      required, e.g. mongodb+srv://user:pass@cluster0.xxxx.mongodb.net
   MONGO_DB       default personal_library
   MAX_IMAGE_MB   default 10
   SESSION_DAYS   default 30
@@ -79,7 +79,9 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # ---------------------------------------------------------------------------
 # Config  (never hardcode real credentials in code; use environment variables)
 # ---------------------------------------------------------------------------
-MONGO_URL = (os.getenv("MONGO_URL"))
+MONGO_URL = os.getenv("MONGO_URL", "").strip().strip('"').strip("'")
+if not MONGO_URL:
+    sys.exit("ERROR: MONGO_URL environment variable is not set. Add it in Render -> Environment (or in .env).")
 MONGO_DB = os.getenv("MONGO_DB", "personal_library")
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "10"))
 MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
@@ -116,8 +118,6 @@ def _explain(err: str) -> str:
                 "project as this cluster, (2) the cluster is not paused, (3) MONGO_URL is correct.")
     if "Authentication failed" in err or "bad auth" in err:
         return "Wrong database username or password in MONGO_URL."
-    if "localhost:27017" in err:
-        return "MONGO_URL is not set, so the app tried localhost. Set MONGO_URL in your environment."
     return "Check MONGO_URL and the MongoDB Atlas network access list."
 
 
@@ -1081,6 +1081,57 @@ setInterval(() => { if (!$("#app").hidden && $("#viewer").hidden && items.length
 </body>
 </html>
 """
+
+
+# Diagnostic: shows this server's public IP and tests the TLS handshake to each Atlas node.
+# Open /debug/network on Render to see exactly what Atlas sees. Remove once the DB works.
+@app.get("/debug/network")
+def debug_network():
+    import socket
+    import ssl
+    import urllib.request
+
+    out = {"python": sys.version.split()[0], "openssl": ssl.OPENSSL_VERSION}
+    try:
+        out["outbound_ip"] = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode()
+    except Exception as exc:
+        out["outbound_ip"] = f"error: {exc}"
+
+    m = re.search(r"@([^/?]+)", MONGO_URL) or re.search(r"://([^/?]+)", MONGO_URL)
+    host_part = m.group(1) if m else ""
+    hosts = []
+    if MONGO_URL.startswith("mongodb+srv://") and host_part:
+        try:
+            import dns.resolver
+            hosts = [(str(r.target).rstrip("."), r.port)
+                     for r in dns.resolver.resolve("_mongodb._tcp." + host_part, "SRV")]
+        except Exception as exc:
+            out["srv_lookup_error"] = str(exc)
+    else:
+        for h in host_part.split(","):
+            name, _, port = h.partition(":")
+            hosts.append((name, int(port or 27017)))
+
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    checks = []
+    for host, port in hosts:
+        item = {"host": host}
+        try:
+            item["resolves_to"] = sorted({a[4][0] for a in socket.getaddrinfo(host, port)})
+        except Exception as exc:
+            item["dns_error"] = str(exc)
+            checks.append(item)
+            continue
+        try:
+            with socket.create_connection((host, port), timeout=8) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as tls:
+                    item["tls"] = "ok (" + str(tls.version()) + ")"
+        except Exception as exc:
+            item["tls"] = f"failed: {exc}"
+        checks.append(item)
+    out["atlas_nodes"] = checks
+    out["db_status"] = "connected" if _db_ready else "unreachable"
+    return out
 
 
 # HEAD is allowed so Render / uptime checks get 200 instead of 405
