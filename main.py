@@ -17,7 +17,7 @@ What it does:
   * Date and time are taken automatically from the browser.
 
 Optional environment variables:
-  MONGO_URL      default mongodb://localhost:27017
+  MONGO_URL      default mongodb://localhost:27017  (MONGODB_URI is also accepted)
   MONGO_DB       default personal_library
   MAX_IMAGE_MB   default 10
   SESSION_DAYS   default 30
@@ -81,7 +81,8 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # ---------------------------------------------------------------------------
 # Config  (never hardcode real credentials in code; use environment variables)
 # ---------------------------------------------------------------------------
-MONGO_URL = os.getenv("MONGO_URL")
+MONGO_URL = (os.getenv("MONGO_URL") or os.getenv("MONGODB_URI") or os.getenv("MONGODB_URL")
+             or "mongodb://localhost:27017").strip()
 MONGO_DB = os.getenv("MONGO_DB", "personal_library")
 MAX_IMAGE_MB = int(os.getenv("MAX_IMAGE_MB", "10"))
 MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024
@@ -103,30 +104,38 @@ users = db["users"]            # one record per email
 sessions = db["sessions"]      # login sessions (auto-expire)
 
 
+_db_ready = False
+_db_error = ""
+
+
+def ensure_db() -> None:
+    """Connect once and create indexes. Raises HTTP 503 (instead of crashing the app) if MongoDB is unreachable."""
+    global _db_ready, _db_error
+    if _db_ready:
+        return
+    try:
+        client.admin.command("ping")
+        notes.create_index([("email", 1), ("created_at", -1)])
+        images.create_index([("email", 1)])
+        users.create_index("email", unique=True)
+        sessions.create_index("token_hash", unique=True)
+        sessions.create_index("expires_at", expireAfterSeconds=0)
+        _db_ready = True
+        _db_error = ""
+    except PyMongoError as exc:
+        _db_error = str(exc)[:300]
+        raise HTTPException(
+            status_code=503,
+            detail="Database is not reachable. Check MONGO_URL and the MongoDB Atlas network access list.",
+        )
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            client.admin.command("ping")
-            last_error = None
-            break
-        except PyMongoError as exc:
-            last_error = exc
-            print(f"MongoDB connection attempt {attempt}/3 failed.")
-            if attempt < 3:
-                await asyncio.sleep(3)
-    if last_error is not None:
-        raise RuntimeError(
-            "Cannot connect to MongoDB. If you use MongoDB Atlas: open Network Access and allow this "
-            "server's IP (on Render use 0.0.0.0/0), and check the user/password in MONGO_URL. "
-            f"Details: {str(last_error)[:300]}"
-        )
-    notes.create_index([("email", 1), ("created_at", -1)])
-    images.create_index([("email", 1)])
-    users.create_index("email", unique=True)
-    sessions.create_index("token_hash", unique=True)
-    sessions.create_index("expires_at", expireAfterSeconds=0)
+    try:
+        ensure_db()
+    except HTTPException:
+        print(f"WARNING: MongoDB is not reachable yet; will retry on each request. Details: {_db_error}")
     yield
     client.close()
 
@@ -218,6 +227,7 @@ def start_session(response: Response, email: str) -> None:
 
 
 def current_user(request: Request) -> str:
+    ensure_db()
     token = request.cookies.get(COOKIE_NAME)
     if token:
         session = sessions.find_one({"token_hash": token_digest(token)})
@@ -228,6 +238,7 @@ def current_user(request: Request) -> str:
 
 @app.post("/api/login")
 def login(body: LoginBody, response: Response):
+    ensure_db()
     email = clean_email(body.email)
     now = utc_now()
     users.update_one(
@@ -1050,6 +1061,11 @@ setInterval(() => { if (!$("#app").hidden && $("#viewer").hidden && items.length
 </body>
 </html>
 """
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "database": "connected" if _db_ready else "unreachable"}
 
 
 @app.get("/", response_class=HTMLResponse)
