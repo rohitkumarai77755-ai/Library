@@ -4,3 +4,5 @@ pymongo>=4.6
 python-multipart>=0.0.9
 email-validator>=2.1
 python-dotenv>=1.0
+certifi
+dnspython>=2.4
